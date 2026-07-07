@@ -45,6 +45,7 @@ export default function App() {
   useEffect(() => {
     if (!authed) return; // no cargar datos sin sesión
     let mounted = true;
+    setError(null); // limpia cualquier error previo al entrar autenticado
 
     const loadData = async (isPoll) => {
       try {

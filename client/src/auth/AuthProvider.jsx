@@ -47,8 +47,9 @@ export function AuthProvider({ children }) {
     enabled: state.enabled,
     session: state.session,
     user: state.session?.user || null,
-    // Autenticado si la auth está apagada, o si hay sesión.
-    authed: !state.enabled || !!state.session,
+    // Autenticado solo cuando ya cargó la config Y (auth apagada o hay sesión).
+    // Mientras loading=true, authed=false para no pedir datos sin token.
+    authed: !state.loading && (!state.enabled || !!state.session),
     signIn: (email, password) => state.supabase.auth.signInWithPassword({ email, password }),
     signOut: () => (state.supabase ? state.supabase.auth.signOut() : Promise.resolve()),
   };
