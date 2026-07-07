@@ -1,4 +1,6 @@
 require('dotenv').config();
+const path = require('path');
+const fs = require('fs');
 const express = require('express');
 const cors = require('cors');
 const cron = require('node-cron');
@@ -91,6 +93,15 @@ app.post('/api/history/snapshot', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+// En producción, el mismo server sirve el build del cliente (SPA).
+const clientDist = path.join(__dirname, '..', 'client', 'dist');
+if (fs.existsSync(clientDist)) {
+  app.use(express.static(clientDist));
+  // Fallback SPA: cualquier ruta que no sea /api devuelve index.html.
+  app.get(/^(?!\/api).*/, (req, res) => res.sendFile(path.join(clientDist, 'index.html')));
+  console.log('[cobranzas-dashboard] Sirviendo cliente estático desde client/dist');
+}
 
 app.listen(PORT, async () => {
   console.log(`\n[cobranzas-dashboard] API en http://localhost:${PORT}`);
