@@ -5,17 +5,22 @@
 
 // Orden fijo + etiqueta legible de cada intención (usado también para colores en el front).
 const INTENCION_LABELS = {
+  ya_pago: 'Ya pagó',
   pago_inmediato: 'Pago inmediato',
   fecha_especifica: 'Fecha específica',
   negociacion: 'Negociación / plan',
+  proximo_corte: 'Próximo corte',
   promesa_vaga: 'Promesa vaga',
+  ninguno: 'Contactado, sin compromiso',
+  evasivo: 'Evasivo',
+  sin_dato: 'Sin clasificar',
   disputa: 'Disputa',
   sin_intencion: 'Sin intención',
   no_contesta: 'No contesta',
 };
 
 // Intenciones que cuentan como "compromiso de pago" para la tasa correspondiente.
-const INTENCION_CON_COMPROMISO = new Set(['pago_inmediato', 'fecha_especifica', 'negociacion']);
+const INTENCION_CON_COMPROMISO = new Set(['ya_pago', 'pago_inmediato', 'fecha_especifica', 'negociacion', 'proximo_corte']);
 
 const round2 = (n) => Math.round(n * 100) / 100;
 
@@ -102,6 +107,7 @@ function computeMetrics(clientes, llamadas) {
 
   return {
     totalClientes,
+    clientesHabilitados: clientes.filter((c) => c.enabled).length,
     clientesContactados,
     tasaContacto: totalClientes ? round2((clientesContactados / totalClientes) * 100) : 0,
     totalLlamadas: llamadas.length,

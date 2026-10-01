@@ -41,9 +41,13 @@ const phoneKey = (v) => String(v || '').replace(/\D/g, '').slice(-10);
 // Normaliza intencion_pago a una de las 7 categorías canónicas, tolerando
 // acentos, mayúsculas, espacios y sinónimos comunes del agente.
 const INTENCION_CANON = new Set([
-  'pago_inmediato', 'fecha_especifica', 'negociacion', 'promesa_vaga', 'disputa', 'sin_intencion', 'no_contesta',
+  'pago_inmediato', 'fecha_especifica', 'negociacion', 'proximo_corte', 'promesa_vaga',
+  'ya_pago', 'ninguno', 'evasivo', 'disputa', 'sin_intencion', 'no_contesta', 'ivr', 'sin_dato',
 ]);
 const INTENCION_SINONIMOS = {
+  pagado: 'ya_pago', pago_realizado: 'ya_pago', ya_pagado: 'ya_pago', pago_hecho: 'ya_pago',
+  ninguna: 'ninguno', sin_compromiso: 'ninguno', contactado_sin_intencion: 'ninguno',
+  evasiva: 'evasivo', evade: 'evasivo', esquivo: 'evasivo',
   pago_hoy: 'pago_inmediato', paga_hoy: 'pago_inmediato', inmediato: 'pago_inmediato',
   fecha: 'fecha_especifica', fecha_pago: 'fecha_especifica', promesa_fecha: 'fecha_especifica',
   negociar: 'negociacion', plan_pago: 'negociacion', plan: 'negociacion', acuerdo: 'negociacion', quita: 'negociacion',
@@ -53,13 +57,15 @@ const INTENCION_SINONIMOS = {
   no_contactado: 'no_contesta', buzon: 'no_contesta', no_responde: 'no_contesta', no_contesto: 'no_contesta', sin_respuesta: 'no_contesta', voicemail: 'no_contesta',
 };
 function normalizeIntencion(v) {
-  if (!v) return 'no_contactado';
+  // La llamada existe pero sin intención capturada -> 'sin_dato' (distinto de
+  // 'no_contactado', que es para clientes que NUNCA se llamaron).
+  if (!v) return 'sin_dato';
   const key = String(v).trim().toLowerCase()
     .normalize('NFD').replace(/[̀-ͯ]/g, '') // quita acentos
     .replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '');
   if (INTENCION_CANON.has(key)) return key;
   if (INTENCION_SINONIMOS[key]) return INTENCION_SINONIMOS[key];
-  return key || 'no_contactado'; // desconocido: se muestra tal cual, sin romper
+  return key || 'sin_dato'; // desconocido: se muestra tal cual, sin romper
 }
 
 // n8n a veces envuelve la salida. Aceptamos: [ ... ] | { data:[...] } |
@@ -93,6 +99,10 @@ function normalizeCliente(r) {
     dias_mora: num(pick(lc, 'dias_mora', 'dias_vencido', 'days_overdue', 'mora')),
     ultimo_pago: str(pick(lc, 'ultimo_pago', 'last_payment', 'fecha_ultimo_pago', 'fechahora') || ''),
     email: str(pick(lc, 'email', 'correo') || ''),
+    // Fila original completa: conserva TODAS las columnas de la tabla (RNC,
+    // FechaSync, etc.) aunque la UI no las muestre. Uso interno del backend
+    // (Asistente IA); se elimina antes de mandar al navegador.
+    _raw: r,
   };
 }
 
@@ -108,6 +118,8 @@ function normalizeLlamada(r) {
     notas: str(pick(lc, 'notas', 'notes', 'resumen', 'summary') || ''),
     transcripcion: str(pick(lc, 'transcripcion', 'transcript', 'transcripcion_texto') || ''),
     grabacion: str(pick(lc, 'grabacion', 'recording', 'recording_url', 'audio_url') || ''),
+    // Fila original completa (incluye columnas no mapeadas, p.ej. follow_up).
+    _raw: r,
   };
 }
 
@@ -136,7 +148,10 @@ async function fetchFromN8n() {
     callWebhook(process.env.N8N_WEBHOOK_CLIENTES),
     hasLlamadas ? callWebhook(process.env.N8N_WEBHOOK_LLAMADAS) : Promise.resolve([]),
   ]);
-  const clientes = toArray(rawC, 'clientes').map(normalizeCliente).filter((c) => c.phone);
+  // Los clientes SIN teléfono se conservan: su deuda cuenta en los totales,
+  // solo que no son llamables (no hay a quién marcar). El filtro anterior los
+  // descartaba y su deuda desaparecía de la cartera.
+  const clientes = toArray(rawC, 'clientes').map(normalizeCliente);
   const llamadas = toArray(rawL, 'llamadas').map(normalizeLlamada).filter((l) => l.phone);
   return { clientes, llamadas };
 }

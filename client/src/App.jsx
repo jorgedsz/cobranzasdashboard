@@ -6,21 +6,30 @@ import KpiCard from './components/KpiCard';
 import BarList from './components/BarList';
 import Donut from './components/Donut';
 import CarteraTable from './components/CarteraTable';
-import CallsTable from './components/CallsTable';
 import ClientesTable from './components/ClientesTable';
 import AiPanel from './components/AiPanel';
 import HistoryCard from './components/HistoryCard';
 import AssistantView from './components/AssistantView';
 import Login from './components/Login';
 import UsersAdmin from './components/UsersAdmin';
+import PagosModal from './components/PagosModal';
 import { useAuth } from './auth/AuthProvider';
+import { getAuthToken } from './auth/token';
 
 const TABS = [
-  { id: 'dashboard', label: 'Dashboard', icon: '📊' },
-  { id: 'clientes', label: 'Clientes', icon: '👥' },
-  { id: 'llamadas', label: 'Llamadas', icon: '📞' },
-  { id: 'asistente', label: 'Asistente IA', icon: '🤖' },
+  { id: 'dashboard', label: 'Dashboard', icon: '📊', perm: 'cobranzas.cartera' },
+  { id: 'clientes', label: 'Clientes y llamadas', icon: '👥', perm: 'cobranzas.clientes' },
+  { id: 'asistente', label: 'Asistente IA', icon: '🤖', perm: 'cobranzas.asistente' },
 ];
+
+// Conmutador entre plataformas.
+const PLATS = [
+  { key: 'inbox', label: 'Conversaciones', icon: '💬', url: 'https://whatsapp.neboaiconsulting.com' },
+  { key: 'cotizaciones', label: 'Cotizaciones', icon: '📄', url: 'https://panelcotizaciones.neboaiconsulting.com' },
+  { key: 'cobranzas', label: 'Cobranzas', icon: '💰', url: 'https://panelcobranzas.neboaiconsulting.com' },
+  { key: 'marketing', label: 'Marketing', icon: '🎬', url: 'https://panelmarketing.neboaiconsulting.com' },
+];
+const MARKETING_URL = PLATS.find((p) => p.key === 'marketing').url;
 
 export default function App() {
   const { loading: authLoading, authed, enabled: authEnabled, user, signOut } = useAuth();
@@ -32,6 +41,7 @@ export default function App() {
   const [analyzing, setAnalyzing] = useState(true);
   const [lastUpdate, setLastUpdate] = useState(null);
   const [me, setMe] = useState(null);
+  const [pagosOpen, setPagosOpen] = useState(false);
   const [theme, setTheme] = useState(() => document.documentElement.getAttribute('data-theme') || 'light');
   const llamadasCountRef = useRef(null);
 
@@ -43,6 +53,19 @@ export default function App() {
   };
 
   const REFRESH_MS = 60000; // auto-refresh de llamadas cada minuto
+
+  // Sistema de tickets (mismo del inbox): botón flotante 🎫 + modal. Comparte la
+  // sesión Supabase; llama al backend del inbox (CORS ya permite *.neboaiconsulting.com).
+  useEffect(() => {
+    if (authed && window.TicketsWidget) {
+      window.TicketsWidget.init({
+        apiBase: 'https://whatsapp.neboaiconsulting.com',
+        getToken: () => getAuthToken(),
+        getUser: () => (user ? { email: user.email, name: user.user_metadata && user.user_metadata.full_name } : null),
+        app: 'cobranzas',
+      });
+    }
+  }, [authed, user]);
 
   useEffect(() => {
     if (!authed) return; // no cargar datos sin sesión
@@ -71,7 +94,6 @@ export default function App() {
     fetchAnalysis().then((a) => mounted && setAnalysis(a)).catch((e) => mounted && setError(e.message)).finally(() => mounted && setAnalyzing(false));
     fetchHistory().then((h) => mounted && setHistory(h)).catch(() => {});
     fetchMe().then((r) => mounted && setMe(r)).catch(() => {});
-
     const id = setInterval(() => loadData(true), REFRESH_MS);
     return () => { mounted = false; clearInterval(id); };
   }, [authed]);
@@ -79,6 +101,11 @@ export default function App() {
   const refreshAnalysis = () => {
     setAnalyzing(true);
     fetchAnalysis(true).then(setAnalysis).catch((e) => setError(e.message)).finally(() => setAnalyzing(false));
+  };
+
+  // Recarga los datos (tras activar/desactivar clientes o lanzar llamadas).
+  const reloadData = () => {
+    fetchData().then((d) => { setData(d); setLastUpdate(new Date()); }).catch(() => {});
   };
 
   // Une cartera (deuda) + análisis IA + intención de la última llamada.
@@ -103,12 +130,48 @@ export default function App() {
     });
   }, [data, analysis]);
 
+  // ── Permisos granulares ──
+  // admin de la app o permissions null (sin migrar) = puede todo; si no, solo lo
+  // que traiga la lista. El backend es la fuente de verdad; esto oculta pestañas.
+  const puede = (k) => !me || me.isAdmin || !Array.isArray(me.permissions) || me.permissions.includes(k);
+  const tabsVisibles = TABS.filter((t) => puede(t.perm));
+  // Si la pestaña activa dejó de estar permitida, salta a la primera visible.
+  useEffect(() => {
+    if (!me) return;
+    const activaOk = tab === 'usuarios' ? me.isAdmin : puede((TABS.find((t) => t.id === tab) || {}).perm);
+    if (!activaOk && tabsVisibles[0]) setTab(tabsVisibles[0].id);
+  }, [me]); // eslint-disable-line react-hooks/exhaustive-deps
+
   // ── Gate de autenticación ──
   if (authLoading) {
     return <div className="app"><div className="loading"><div className="spinner" />Cargando…</div></div>;
   }
   if (!authed) {
     return <Login />;
+  }
+
+  // ── Puerta de acceso por plataforma ──
+  // Si el usuario tiene perfil cargado y no incluye 'cobranzas', no entra.
+  if (me && Array.isArray(me.platforms) && me.platforms.length && !me.platforms.includes('cobranzas')) {
+    const destinos = {
+      inbox: ['Conversaciones', 'https://whatsapp.neboaiconsulting.com'],
+      cotizaciones: ['Panel de cotizaciones', 'https://panelcotizaciones.neboaiconsulting.com'],
+    };
+    return (
+      <div className="app">
+        <div className="noacc">
+          <div className="noacc__ic">🔒</div>
+          <h1>Sin acceso a Cobranzas</h1>
+          <p>Tu usuario no tiene permiso para esta plataforma. Pídeselo a un administrador.</p>
+          <div className="noacc__links">
+            {me.platforms.filter((p) => destinos[p]).map((p) => (
+              <a key={p} className="noacc__link" href={destinos[p][1]}>{destinos[p][0]} →</a>
+            ))}
+          </div>
+          <button className="noacc__out" onClick={signOut}>Cerrar sesión</button>
+        </div>
+      </div>
+    );
   }
 
   if (error) {
@@ -134,6 +197,14 @@ export default function App() {
         <div>
           <h1>Cobranzas IA · Panel de cartera</h1>
         </div>
+        <nav className="platsw" aria-label="Cambiar de plataforma">
+          {/* Marketing se ve siempre: quien no tenga acceso ve allá un aviso claro (pedido 2026-09-23). */}
+          {PLATS.filter((p) => p.key === 'cobranzas' || p.key === 'marketing' || !me || !Array.isArray(me.platforms) || !me.platforms.length || me.platforms.includes(p.key)).map((p) => (
+            p.key === 'cobranzas'
+              ? <span key={p.key} className="platsw__it platsw__it--on" title="Estás aquí"><span className="platsw__ic">{p.icon}</span>{p.label}</span>
+              : <a key={p.key} className="platsw__it" href={p.url} title={`Ir a ${p.label}`}><span className="platsw__ic">{p.icon}</span>{p.label}</a>
+          ))}
+        </nav>
         <div className="badges">
           <span className="badge live"><span className="dot pulse" />En vivo · cada 60s</span>
           {lastUpdate && (
@@ -144,6 +215,28 @@ export default function App() {
           <span className="badge ai">
             {analysis?.generado_por === 'openai' ? `IA · ${analysis.modelo}` : 'Heurística (sin API key)'}
           </span>
+          {puede('jarvis.usar') && (
+            <button
+              className="btn secondary"
+              title="Abrir Jarvis"
+              onClick={() => window.open(
+                // El token va en el fragmento de la URL, no en la query: no llega
+                // al servidor de Jarvis dentro de la URL, asi que no queda en sus
+                // logs de acceso ni se filtra por la cabecera Referer.
+                'https://jarvis-production-71c4.up.railway.app/entrar#t=' + encodeURIComponent(getAuthToken()),
+                '_blank'
+              )}
+            >
+              🧠 Jarvis
+            </button>
+          )}
+          {/* A diferencia de puede(), exige la lista cargada: lo que se debe no se
+              muestra "por las dudas" mientras /api/me no respondió. */}
+          {me && Array.isArray(me.permissions) && me.permissions.includes('pagos.ver') && (
+            <button className="btn secondary" title="Lo que se debe" onClick={() => setPagosOpen(true)}>
+              💳 Pagos
+            </button>
+          )}
           <button className="btn secondary icon-btn" onClick={toggleTheme} title={theme === 'dark' ? 'Tema claro' : 'Tema oscuro'} aria-label="Cambiar tema">
             {theme === 'dark' ? '☀️' : '🌙'}
           </button>
@@ -160,11 +253,10 @@ export default function App() {
       </header>
 
       <nav className="tabs">
-        {TABS.map((t) => (
+        {tabsVisibles.map((t) => (
           <button key={t.id} className={`tab ${tab === t.id ? 'active' : ''}`} onClick={() => setTab(t.id)}>
             <span className="tab-ic">{t.icon}</span>{t.label}
             {t.id === 'clientes' && <span className="tab-count">{num(m.totalClientes)}</span>}
-            {t.id === 'llamadas' && <span className="tab-count">{num(m.totalLlamadas)}</span>}
           </button>
         ))}
         {me && me.isAdmin && (
@@ -174,25 +266,21 @@ export default function App() {
         )}
       </nav>
 
-      {tab === 'dashboard' && (
+      {tab === 'dashboard' && puede('cobranzas.cartera') && (
         <DashboardView m={m} analysis={analysis} analyzing={analyzing} rows={rows} history={history} />
       )}
 
-      {tab === 'clientes' && (
+      {tab === 'clientes' && puede('cobranzas.clientes') && (
         <div className="card" style={{ padding: 0 }}>
-          <ClientesTable clientes={data.clientes} />
+          <ClientesTable clientes={data.clientes} llamadas={data.llamadas} onChanged={reloadData} />
         </div>
       )}
 
-      {tab === 'llamadas' && (
-        <div className="card" style={{ padding: 0 }}>
-          <CallsTable llamadas={data.llamadas} />
-        </div>
-      )}
-
-      {tab === 'asistente' && <AssistantView />}
+      {tab === 'asistente' && puede('cobranzas.asistente') && <AssistantView />}
 
       {tab === 'usuarios' && me && me.isAdmin && <UsersAdmin currentEmail={me.email} />}
+
+      {pagosOpen && <PagosModal onClose={() => setPagosOpen(false)} />}
 
       <div className="footer">
         Prototipo · fuente: {data.source}. Conecta los webhooks de n8n en <code>server/.env</code> para datos en vivo.
@@ -228,6 +316,8 @@ function DashboardView({ m, analysis, analyzing, rows, history }) {
           foot={`${pct((m.deudaVencida / m.deudaTotal) * 100)} del total`} footTone="bad" />
         <KpiCard label="Recuperación estimada (IA)" value={analysis ? money(analysis.recuperacion_estimada) : '…'} accent="var(--good)"
           foot={analysis ? `${pct((analysis.recuperacion_estimada / m.deudaVencida) * 100)} de lo vencido` : 'Analizando…'} footTone="good" />
+        <KpiCard label="Activos para llamar" value={num(m.clientesHabilitados || 0)} accent="var(--good)"
+          foot={`de ${num(m.totalClientes)} · cron diario 10:00`} />
         <KpiCard label="Tasa de contacto" value={pct(m.tasaContacto)} accent="var(--series-2)"
           foot={`${num(m.clientesContactados)}/${num(m.totalClientes)} contactados`} />
         <KpiCard label="Compromisos de pago" value={num(m.llamadasConCompromiso)} accent="var(--series-5)"

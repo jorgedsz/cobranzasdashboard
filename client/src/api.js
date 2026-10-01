@@ -49,7 +49,38 @@ async function patch(path, payload) {
   return res.json();
 }
 
+async function put(path, payload) {
+  const res = await fetch(path, {
+    method: 'PUT',
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
 export const askAI = (question) => post('/api/ask', { question });
+export const fetchChatHistory = () => get('/api/ask/history');
+export const clearChatHistory = () => del('/api/ask/history');
+
+// ── Llamadas ──
+export const setClientesEnabled = (phones, enabled) => patch('/api/clientes/enabled', { phones, enabled });
+export const triggerCalls = (phones, origen = 'manual') => post('/api/calls/trigger', { phones, origen });
+export const fetchQueue = () => get('/api/calls/queue');
+export const cancelQueue = () => del('/api/calls/queue');
+export const resetIvr = (phone) => post(`/api/clientes/${phone}/ivr/reset`, {});
+export const fetchLists = () => get('/api/lists');
+export const createList = (name, phones) => post('/api/lists', { name, phones });
+export const updateList = (id, payload) => put(`/api/lists/${id}`, payload);
+export const deleteList = (id) => del(`/api/lists/${id}`);
+export const fetchSchedule = () => get('/api/calls/schedule');
+export const saveSchedule = (cfg) => put('/api/calls/schedule', cfg);
+// Agentes de voz disponibles (el servidor proxea el servicio; la key no viaja al navegador).
+export const fetchAgents = () => get('/api/agents');
+export const enqueueEnabled = () => post('/api/calls/enqueue-enabled', {});
 
 // ── Auth / usuarios ──
 export const fetchMe = () => get('/api/me');

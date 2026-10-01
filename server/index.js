@@ -9,13 +9,35 @@ const { getCachedData, cacheInfo } = require('./services/cache');
 const { computeMetrics } = require('./services/metrics');
 const { analyzePortfolio } = require('./services/ai');
 const { ask } = require('./services/ask');
-const { requireAuth, requireAdmin, publicConfig, authEnabled } = require('./services/auth');
+const chatStore = require('./services/chatStore');
+const { requireAuth, requireAdmin, requirePlatform, requirePermission, publicConfig, authEnabled, perfilDe, plataformasDe, permisosDe } = require('./services/auth');
 const users = require('./services/users');
+const clienteConfig = require('./services/clienteConfig');
+const callLists = require('./services/callLists');
+const ivr = require('./services/ivr');
+const calls = require('./services/calls');
+const queue = require('./services/queue');
+const schedule = require('./services/schedule');
+const agents = require('./services/agents');
+const promesas = require('./services/promesas');
 const history = require('./services/history');
 
 const app = express();
+
+// ── Seguridad: cabeceras + rate limit ────────────────────────────────────────
+const { hardening, rateLimit } = require('./security');
+hardening(app);
 app.use(cors());
 app.use(express.json());
+
+// Rate limit por IP SOLO para el panel. Endpoints de máquina/audio (health,
+// config, recordings, hooks) EXENTOS.
+const esMaquinaCo = req => /^\/(health|config|recordings|hooks)/.test(req.path);
+app.use('/api', rateLimit({
+  windowMs: Number(process.env.RATE_LIMIT_WINDOW_MS || 60000),
+  max: Number(process.env.RATE_LIMIT_USER || 300),
+  skip: esMaquinaCo
+}));
 
 const PORT = process.env.PORT || 3001;
 
@@ -35,18 +57,96 @@ app.get('/api/health', (req, res) => {
 // Config pública para inicializar Supabase en el frontend (no expone secretos).
 app.get('/api/config', (req, res) => res.json(publicConfig()));
 
+// Proxy de grabaciones (público: el <audio> no puede mandar token). Con
+// allowlist de hosts. Re-sirve el WAV con Content-Length + Range para que el
+// reproductor inline funcione.
+app.get('/api/recordings/proxy', require('./services/recordingProxy').handle);
+
 // A partir de aquí, todas las rutas /api requieren sesión (si la auth está activada).
 app.use('/api', requireAuth);
 
-// Fuentes + métricas puras (servidas desde el caché con TTL).
+// /api/me va ANTES del gate de plataforma: aunque el usuario no tenga acceso a
+// cobranzas, el frontend necesita leer sus plataformas para mostrar la pantalla
+// de "sin acceso" (y a qué sí puede entrar).
+app.get('/api/me', async (req, res) => {
+  const p = req.user ? await perfilDe(req.user.id) : null;
+  res.json({
+    email: req.user ? req.user.email : null,
+    isAdmin: req.user ? !!req.user.isAdmin : false,
+    role: (p && p.role) || null,
+    platforms: plataformasDe(p && p.role, p && p.platforms),
+    permissions: req.user && req.user.isAdmin ? permisosDe({ role: 'admin' }) : permisosDe(p || {})
+  });
+});
+
+// El resto exige acceso a la plataforma 'cobranzas'.
+app.use('/api', requirePlatform('cobranzas'));
+
+// Fuentes + métricas puras (servidas desde el caché con TTL), con el flag
+// enabled de cada cliente cruzado desde Supabase (cliente_config).
 app.get('/api/data', async (req, res) => {
   try {
     const { clientes, llamadas, source, cachedAt, cacheAgeMs } = await getCachedData();
-    const metrics = computeMetrics(clientes, llamadas);
-    res.json({ source, clientes, llamadas, metrics, cachedAt, cacheAgeMs });
+
+    let enabledMap = new Map();
+    let ivrMap = new Map();
+    try {
+      [enabledMap, ivrMap] = await Promise.all([clienteConfig.getEnabledMap(), ivr.getIvrMap()]);
+    } catch (e) {
+      console.error('[cliente_config] no disponible, todos disabled:', e.message);
+    }
+    // Última llamada de cada cliente (para mostrar su status en la tabla).
+    const ultimaPorTel = new Map();
+    for (const ll of llamadas) {
+      if (!ll.phone) continue;
+      const prev = ultimaPorTel.get(ll.phone);
+      if (!prev || new Date(ll.created_at) > new Date(prev.created_at)) ultimaPorTel.set(ll.phone, ll);
+    }
+
+    const conFlag = clientes.map((cRaw) => {
+      const { _raw, ...c } = cRaw; // _raw es solo para el backend (Asistente)
+      const i = ivrMap.get(c.phone);
+      const ll = ultimaPorTel.get(c.phone);
+      return {
+        ...c,
+        enabled: enabledMap.get(c.phone) === true,
+        ivr: !!i,
+        ivrTipo: i ? i.tipo : null,
+        ivrDetalle: i ? i.detalle : null,
+        ivrAt: i ? i.at : null,
+        ultimaLlamada: ll
+          ? {
+              fecha: ll.created_at,
+              intencion: ll.intencion_pago,
+              fechaPago: ll.fecha_pago || null,
+              notas: ll.notas || null,
+              transcripcion: ll.transcripcion || null,
+              grabacion: ll.grabacion || null,
+            }
+          : null,
+      };
+    });
+
+    const metrics = computeMetrics(conFlag, llamadas);
+    const llamadasSlim = llamadas.map(({ _raw, ...l }) => l);
+    res.json({ source, clientes: conFlag, llamadas: llamadasSlim, metrics, cachedAt, cacheAgeMs });
   } catch (err) {
     console.error('[/api/data]', err);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: (console.error(req.path, err), 'Error interno del servidor') });
+  }
+});
+
+// Activar / desactivar clientes para el cron de llamadas (uno o varios).
+app.patch('/api/clientes/enabled', requirePermission('cobranzas.cliente_toggle'), async (req, res) => {
+  try {
+    const { phones, enabled } = req.body || {};
+    if (!Array.isArray(phones) || !phones.length) return res.status(400).json({ error: 'Falta phones[]' });
+    if (typeof enabled !== 'boolean') return res.status(400).json({ error: 'Falta enabled (boolean)' });
+    const out = await clienteConfig.setEnabled(phones, enabled, req.user ? req.user.email : null);
+    res.json(out);
+  } catch (err) {
+    console.error('[/api/clientes/enabled]', err);
+    res.status(err.status || 500).json({ error: err.status ? err.message : (console.error(req.path, err), 'Error interno del servidor') });
   }
 });
 
@@ -66,30 +166,47 @@ app.get('/api/analyze', async (req, res) => {
     res.json({ ...analysis, cached: false });
   } catch (err) {
     console.error('[/api/analyze]', err);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: (console.error(req.path, err), 'Error interno del servidor') });
   }
 });
 
 // Asistente: pregunta libre / proyección sobre los datos de la cartera.
-app.post('/api/ask', async (req, res) => {
+app.post('/api/ask', requirePermission('cobranzas.asistente'), async (req, res) => {
   try {
     const question = (req.body && req.body.question || '').toString().trim();
     if (!question) return res.status(400).json({ error: 'Falta la pregunta.' });
     if (question.length > 2000) return res.status(400).json({ error: 'Pregunta demasiado larga.' });
     const result = await ask(question);
+    // Persistir el intercambio en el chat del usuario.
+    if (req.user && result.answer && !result.noKey) {
+      chatStore.append(req.user.email, question, result.answer, {
+        model: result.model, usage: result.usage, costUsd: result.costUsd,
+      }).catch(() => {});
+    }
     res.json(result);
   } catch (err) {
     console.error('[/api/ask]', err);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: (console.error(req.path, err), 'Error interno del servidor') });
   }
 });
 
-// Historial de deuda por día (agregado) + histórico crudo.
-app.get('/api/history', (req, res) => {
+// Historial del chat del Asistente (por usuario).
+app.get('/api/ask/history', requirePermission('cobranzas.asistente'), async (req, res) => {
+  try { res.json({ thread: await chatStore.getThread(req.user && req.user.email) }); }
+  catch (err) { res.status(500).json({ error: (console.error(req.path, err), 'Error interno del servidor') }); }
+});
+
+app.delete('/api/ask/history', requirePermission('cobranzas.asistente'), async (req, res) => {
+  try { await chatStore.clear(req.user && req.user.email); res.json({ ok: true }); }
+  catch (err) { res.status(500).json({ error: (console.error(req.path, err), 'Error interno del servidor') }); }
+});
+
+// Historial de deuda por día (agregado desde Supabase).
+app.get('/api/history', async (req, res) => {
   try {
-    res.json({ daily: history.getDailyHistory(), tz: history.TZ });
+    res.json({ daily: await history.getDailyHistory(), tz: history.TZ });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: (console.error(req.path, err), 'Error interno del servidor') });
   }
 });
 
@@ -99,22 +216,173 @@ app.post('/api/history/snapshot', async (req, res) => {
     const snap = await history.takeSnapshot('manual');
     res.json(snap);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: (console.error(req.path, err), 'Error interno del servidor') });
   }
 });
 
-// Info del usuario actual (para el frontend: mostrar email + si es admin).
-app.get('/api/me', (req, res) => {
-  res.json({
-    email: req.user ? req.user.email : null,
-    isAdmin: req.user ? !!req.user.isAdmin : false,
-  });
+// Lanza llamadas. 1 cliente = inmediata. Varios = se ENCOLAN (1 por minuto,
+// dentro del horario laboral). La cola vive en Supabase y sobrevive reinicios.
+app.post('/api/calls/trigger', requirePermission('cobranzas.llamadas'), async (req, res) => {
+  try {
+    const { phones, origen } = req.body || {};
+    if (!Array.isArray(phones) || !phones.length) return res.status(400).json({ error: 'Falta phones[]' });
+    if (!calls.callsEnabled) return res.status(503).json({ error: 'Llamadas no configuradas (falta N8N_CALL_URL)' });
+
+    const { clientes } = await getCachedData();
+    const byPhone = new Map(clientes.map((c) => [c.phone, c]));
+    const objetivo = phones.map((p) => byPhone.get(String(p))).filter((c) => c && c.phone);
+    if (!objetivo.length) return res.status(404).json({ error: 'Ningún cliente coincide con esos teléfonos' });
+
+    const por = req.user ? req.user.email : null;
+
+    // Los marcados como IVR se excluyen del BULK/cron automáticamente. A mano
+    // (origen 'manual') SÍ se permiten: es una decisión explícita del agente.
+    const esManual = origen === 'manual';
+    const ivrPhones = esManual ? new Set() : await ivr.getIvrPhones();
+    const permitidos = objetivo.filter((c) => !ivrPhones.has(c.phone));
+    const omitidosIvr = objetivo.length - permitidos.length;
+    if (!permitidos.length) {
+      return res.status(409).json({ error: `Omitido: ${omitidosIvr} cliente(s) están marcados como IVR y no se llaman.` });
+    }
+
+    // Una sola: se dispara al momento (no espera turno en la cola).
+    if (permitidos.length === 1) {
+      const r = await calls.triggerBatch(permitidos, 'manual', por);
+      return res.json({ ...r, inmediata: true, omitidosIvr });
+    }
+
+    // Varias: a la cola persistente (enqueue vuelve a filtrar IVR por seguridad).
+    const r = await queue.enqueue(permitidos, origen === 'cron' ? 'cron' : 'bulk', por);
+    const st = await queue.status();
+    res.json({ ...r, encolado: true, enHorario: st.enHorario, horario: st.horario, minutosEstimados: st.minutosEstimados });
+  } catch (err) {
+    console.error('[/api/calls/trigger]', err);
+    res.status(500).json({ error: (console.error(req.path, err), 'Error interno del servidor') });
+  }
+});
+
+// ── Listas de llamadas (segmentos guardados) ──
+app.get('/api/lists', requirePermission('cobranzas.llamadas'), async (req, res) => {
+  try { res.json({ lists: await callLists.list() }); }
+  catch (err) { res.status(500).json({ error: (console.error(req.path, err), 'Error interno del servidor') }); }
+});
+
+app.post('/api/lists', requirePermission('cobranzas.llamadas'), async (req, res) => {
+  try {
+    const { name, phones } = req.body || {};
+    if (!name || !String(name).trim()) return res.status(400).json({ error: 'Falta el nombre de la lista' });
+    if (!Array.isArray(phones) || !phones.length) return res.status(400).json({ error: 'La lista no tiene clientes' });
+    const row = await callLists.create(String(name).trim(), phones, req.user ? req.user.email : null);
+    res.json({ ok: true, id: row && row.id });
+  } catch (err) { res.status(500).json({ error: (console.error(req.path, err), 'Error interno del servidor') }); }
+});
+
+app.put('/api/lists/:id', requirePermission('cobranzas.llamadas'), async (req, res) => {
+  try {
+    const { name, phones } = req.body || {};
+    res.json(await callLists.update(req.params.id, { name, phones }));
+  } catch (err) { res.status(500).json({ error: (console.error(req.path, err), 'Error interno del servidor') }); }
+});
+
+app.delete('/api/lists/:id', requirePermission('cobranzas.llamadas'), async (req, res) => {
+  try { res.json(await callLists.remove(req.params.id)); }
+  catch (err) { res.status(500).json({ error: (console.error(req.path, err), 'Error interno del servidor') }); }
+});
+
+// Estado de la cola de llamadas.
+app.get('/api/calls/queue', requirePermission('cobranzas.llamadas'), async (req, res) => {
+  try { res.json(await queue.status()); }
+  catch (err) { res.status(500).json({ error: (console.error(req.path, err), 'Error interno del servidor') }); }
+});
+
+// Horario de llamadas (bloques) — configurado desde la UI.
+app.get('/api/calls/schedule', requirePermission('cobranzas.horario'), async (req, res) => {
+  try { res.json(await schedule.get(true)); }
+  catch (err) { res.status(500).json({ error: (console.error(req.path, err), 'Error interno del servidor') }); }
+});
+
+app.put('/api/calls/schedule', requirePermission('cobranzas.horario'), async (req, res) => {
+  try {
+    const b = req.body || {};
+    const patch = {
+      enabled: !!b.enabled, weekdaysOnly: !!b.weekdaysOnly, autoEnqueue: !!b.autoEnqueue, blocks: b.blocks,
+    };
+    // El agente solo se toca si viene en el body, para no borrarlo sin querer
+    // al guardar otros ajustes. agentId '' o null => sin agente.
+    if ('agentId' in b) {
+      patch.agentId = b.agentId || null;
+      patch.agentName = b.agentName || null;
+    }
+    const cfg = await schedule.set(patch, req.user ? req.user.email : null);
+    res.json(cfg);
+  } catch (err) {
+    res.status(err.status || 500).json({ error: err.status ? err.message : (console.error(req.path, err), 'Error interno del servidor') });
+  }
+});
+
+// Agentes de voz disponibles (para elegir quién llama). Se consulta desde el
+// servidor: la API key nunca sale al navegador.
+app.get('/api/agents', async (req, res) => {
+  try { res.json(await agents.list()); }
+  catch (err) { res.status(500).json({ error: (console.error(req.path, err), 'Error interno del servidor') }); }
+});
+
+// Encola manualmente a los clientes activos ahora (sin esperar al bloque).
+app.post('/api/calls/enqueue-enabled', requirePermission('cobranzas.llamadas'), async (req, res) => {
+  try {
+    if (!calls.callsEnabled) return res.status(503).json({ error: 'Llamadas no configuradas (falta N8N_CALL_URL)' });
+    const n = await queue.autoEnqueueEnabled();
+    res.json({ encoladas: n });
+  } catch (err) { res.status(500).json({ error: (console.error(req.path, err), 'Error interno del servidor') }); }
+});
+
+// Quita la marca de IVR (para reactivar a un cliente si consiguen otro número).
+app.post('/api/clientes/:phone/ivr/reset', async (req, res) => {
+  try { res.json(await ivr.desmarcar(req.params.phone)); }
+  catch (err) { res.status(500).json({ error: (console.error(req.path, err), 'Error interno del servidor') }); }
+});
+
+// Fuerza la detección de IVR ahora (sin esperar al cron).
+app.post('/api/ivr/revisar', async (req, res) => {
+  try {
+    const { llamadas } = await getCachedData(true);
+    res.json(await ivr.sincronizar(llamadas));
+  } catch (err) { res.status(500).json({ error: (console.error(req.path, err), 'Error interno del servidor') }); }
+});
+
+// Promesas de pago: resumen (pendientes / cumplidas / incumplidas).
+app.get('/api/promesas', requirePermission('cobranzas.promesas'), async (req, res) => {
+  try { res.json(await promesas.resumen()); }
+  catch (err) { res.status(500).json({ error: (console.error(req.path, err), 'Error interno del servidor') }); }
+});
+
+// Fuerza la revisión de promesas ahora (útil para probar sin esperar al cron).
+app.post('/api/promesas/revisar', requirePermission('cobranzas.promesas'), async (req, res) => {
+  try { res.json(await revisarPromesas()); }
+  catch (err) { res.status(500).json({ error: (console.error(req.path, err), 'Error interno del servidor') }); }
+});
+
+// Cancelar todas las llamadas pendientes en la cola.
+app.delete('/api/calls/queue', requirePermission('cobranzas.llamadas'), async (req, res) => {
+  try { res.json(await queue.cancelarTodo()); }
+  catch (err) { res.status(500).json({ error: (console.error(req.path, err), 'Error interno del servidor') }); }
+});
+
+// Últimos disparos (para auditar qué se lanzó y cuándo).
+app.get('/api/calls/log', requirePermission('cobranzas.clientes'), async (req, res) => {
+  try {
+    const rows = await require('./services/supabaseDb')
+      .select('llamada_disparo', '?select=*&order=created_at.desc&limit=100');
+    res.json({ disparos: rows || [] });
+  } catch (err) {
+    res.status(500).json({ error: (console.error(req.path, err), 'Error interno del servidor') });
+  }
 });
 
 // ── Administración de usuarios (solo admins) ──
 app.get('/api/users', requireAdmin, async (req, res) => {
   try { res.json({ users: await users.listUsers() }); }
-  catch (err) { res.status(err.status || 500).json({ error: err.message }); }
+  catch (err) { res.status(err.status || 500).json({ error: err.status ? err.message : (console.error(req.path, err), 'Error interno del servidor') }); }
 });
 
 app.post('/api/users', requireAdmin, async (req, res) => {
@@ -123,12 +391,12 @@ app.post('/api/users', requireAdmin, async (req, res) => {
     if (!email || !password) return res.status(400).json({ error: 'Email y contraseña requeridos' });
     if (String(password).length < 6) return res.status(400).json({ error: 'La contraseña debe tener al menos 6 caracteres' });
     res.json(await users.createUser({ email: String(email).trim(), password: String(password), admin: !!admin }));
-  } catch (err) { res.status(err.status || 500).json({ error: err.message }); }
+  } catch (err) { res.status(err.status || 500).json({ error: err.status ? err.message : (console.error(req.path, err), 'Error interno del servidor') }); }
 });
 
 app.patch('/api/users/:id', requireAdmin, async (req, res) => {
   try { res.json(await users.updateUser(req.params.id, req.body || {})); }
-  catch (err) { res.status(err.status || 500).json({ error: err.message }); }
+  catch (err) { res.status(err.status || 500).json({ error: err.status ? err.message : (console.error(req.path, err), 'Error interno del servidor') }); }
 });
 
 app.delete('/api/users/:id', requireAdmin, async (req, res) => {
@@ -136,13 +404,15 @@ app.delete('/api/users/:id', requireAdmin, async (req, res) => {
     // Evitar que un admin se borre a sí mismo.
     if (req.user && req.params.id === req.user.id) return res.status(400).json({ error: 'No puedes eliminar tu propia cuenta' });
     res.json(await users.deleteUser(req.params.id));
-  } catch (err) { res.status(err.status || 500).json({ error: err.message }); }
+  } catch (err) { res.status(err.status || 500).json({ error: err.status ? err.message : (console.error(req.path, err), 'Error interno del servidor') }); }
 });
 
 // En producción, el mismo server sirve el build del cliente (SPA).
 const clientDist = path.join(__dirname, '..', 'client', 'dist');
 if (fs.existsSync(clientDist)) {
   app.use(express.static(clientDist));
+  // Política de privacidad: pública, antes del fallback del SPA.
+  app.get('/privacidad', (req, res) => res.sendFile(path.join(clientDist, 'privacidad.html')));
   // Fallback SPA: cualquier ruta que no sea /api devuelve index.html.
   app.get(/^(?!\/api).*/, (req, res) => res.sendFile(path.join(clientDist, 'index.html')));
   console.log('[cobranzas-dashboard] Sirviendo cliente estático desde client/dist');
@@ -165,5 +435,43 @@ app.listen(PORT, async () => {
   const opts = { timezone: history.TZ };
   cron.schedule('0 4 * * *', () => history.takeSnapshot('AM').catch((e) => console.error('[cron AM]', e.message)), opts);
   cron.schedule('0 16 * * *', () => history.takeSnapshot('PM').catch((e) => console.error('[cron PM]', e.message)), opts);
-  console.log(`  Tomas programadas: 04:00 y 16:00 (${history.TZ})\n`);
+  console.log(`  Tomas programadas: 04:00 y 16:00 (${history.TZ})`);
+
+  // Worker de la cola: corre cada CALL_WORKER_INTERVAL_MS (default 15s). En cada
+  // tick, si hay cupo de concurrencia (consultando VAPI) y estamos dentro de un
+  // bloque del horario, lanza UNA llamada. Así llena los cupos rápido y mantiene
+  // hasta CALL_MAX_CONCURRENT simultáneas. También auto-encola a los activos 1x/día.
+  const WORKER_MS = parseInt(process.env.CALL_WORKER_INTERVAL_MS || '15000', 10);
+  setInterval(() => queue.tick().catch((e) => console.error('[cola tick]', e.message)), WORKER_MS);
+
+  // IVR: cada 10 min revisa las llamadas nuevas y desactiva a los que cayeron
+  // en contestadora (para que el cron de las 10 ya no los tome).
+  cron.schedule('*/10 * * * *', () => revisarIvr().catch((e) => console.error('[cron ivr]', e.message)), opts);
+
+  // Promesas: cada día a las 9:30 (antes del cron de las 10) detecta promesas
+  // nuevas y encola al SUB-AGENTE a quienes prometieron y no pagaron.
+  const PROMESA_CRON = process.env.PROMESA_CRON || '30 9 * * *';
+  cron.schedule(PROMESA_CRON, () => revisarPromesas().catch((e) => console.error('[cron promesas]', e.message)), opts);
+  console.log(`  Promesas: ${PROMESA_CRON} (${history.TZ}) · sub-agente ${calls.followupEnabled ? 'ACTIVO' : 'no configurado (usa el principal)'} · gracia ${promesas.GRACIA_DIAS} día(s)`);
+
+  const st = await queue.status().catch(() => null);
+  console.log(`  Llamadas: ${calls.callsEnabled ? 'ACTIVO' : 'inactivo (falta N8N_CALL_URL)'}`);
+  console.log(`  Cola: modo ${st ? st.modo : 'n/d'}${st && st.modo === 'concurrencia' ? ` (máx. ${st.maxConcurrent} simultáneas, vía VAPI)` : ' (1 cada 60s, sin VAPI)'}`);
+  console.log(`  Horario (configurable en la UI): ${st ? (st.scheduleEnabled ? st.horario : 'DESACTIVADO') : 'n/d'}${st ? ` · pendientes: ${st.pendientes}` : ''}\n`);
 });
+
+// Marca como IVR (y desactiva) a los clientes cuyas llamadas cayeron en contestadora.
+async function revisarIvr() {
+  const { llamadas } = await getCachedData();
+  return ivr.sincronizar(llamadas);
+}
+
+// Promesas de pago: (1) detecta promesas nuevas en las llamadas, (2) revisa las
+// vencidas y encola al sub-agente a quien prometió y sigue debiendo.
+async function revisarPromesas() {
+  const { clientes, llamadas } = await getCachedData(true);
+  const sync = await promesas.sincronizar(llamadas, clientes);
+  const rev = await promesas.revisarIncumplidas(clientes);
+  return { ...sync, ...rev };
+}
+
